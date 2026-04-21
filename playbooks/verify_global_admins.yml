@@ -1,0 +1,110 @@
+---
+# filepath: /home/rx836k/code/maester/verify_global_admins.yml
+- name: Verify Approved Global Administrators in Active Directory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # List of approved global administrator accounts (sAMAccountName format)
+    approved_global_admins:
+      - "admin.user1"
+      - "admin.user2"
+      - "service.account1"
+      # Add more approved accounts here
+
+    # Active Directory group name to verify
+    ad_global_admins_group: "Global Administrators"
+
+    # LDAP connection settings (adjust for your environment)
+    ldap_uri: "ldap://ldap.example.com"
+    ldap_bind_dn: "CN=ServiceAccount,OU=ServiceAccounts,DC=example,DC=com"
+    ldap_bind_password: "{{ lookup('env', 'LDAP_BIND_PASSWORD') }}"
+    ldap_base_dn: "DC=example,DC=com"
+
+  tasks:
+    - name: Get members of the AD group 'Global Administrators'
+      community.general.ldap_search:
+        server_uri: "{{ ldap_uri }}"
+        bind_dn: "{{ ldap_bind_dn }}"
+        bind_pw: "{{ ldap_bind_password }}"
+        base_dn: "{{ ldap_base_dn }}"
+        filter: "(cn={{ ad_global_admins_group }})"
+        attrs:
+          - member
+      register: ad_group_info
+
+    - name: Extract current group members from LDAP result
+      set_fact:
+        current_group_members: "{{ ad_group_info.results[0].member | default([]) }}"
+
+    - name: Convert member DNs to sAMAccountName format
+      set_fact:
+        current_member_accounts: "{{ current_group_members | map('regex_replace', 'CN=([^,]+).*', '\\1') | list }}"
+
+    - name: Verify approved admins are members of the AD group
+      ansible.builtin.debug:
+        msg: |
+          Checking if approved global admins are in the AD group...
+      when: current_member_accounts | length > 0
+
+    - name: Find approved admins missing from AD group
+      ansible.builtin.set_fact:
+        missing_from_ad_group: "{{ approved_global_admins | reject('in', current_member_accounts) | list }}"
+
+    - name: Report approved admins NOT in AD group (verification failure)
+      ansible.builtin.debug:
+        msg: |
+          ⚠️ VERIFICATION FAILED: The following approved global admins are NOT members of '{{ ad_global_admins_group }}':
+          {% for user in missing_from_ad_group %}
+          - {{ user }}
+          {% endfor %}
+      when: missing_from_ad_group | length > 0
+
+    - name: Report approved admins successfully in AD group
+      ansible.builtin.debug:
+        msg: |
+          ✅ The following approved global admins ARE members of '{{ ad_global_admins_group }}':
+          {% for user in approved_global_admins %}
+          {% if user in current_member_accounts %}
+          - {{ user }}
+          {% endif %}
+          {% endfor %}
+      when: missing_from_ad_group | length == 0
+
+    - name: Find AD group members NOT in approved list (unauthorized)
+      ansible.builtin.set_fact:
+        unauthorized_members: "{{ current_member_accounts | reject('in', approved_global_admins) | list }}"
+
+    - name: Report unauthorized members in AD group
+      ansible.builtin.debug:
+        msg: |
+          🚨 SECURITY ALERT: The following accounts are members of '{{ ad_global_admins_group }}'
+          but are NOT in the approved_global_admins list:
+          {% for user in unauthorized_members %}
+          - {{ user }}
+          {% endfor %}
+      when: unauthorized_members | length > 0
+
+    - name: Summary - All checks passed
+      ansible.builtin.debug:
+        msg: |
+          ✅ VERIFICATION COMPLETE: All approved global administrators are members of '{{ ad_global_admins_group }}'
+          and there are no unauthorized members.
+      when:
+        - missing_from_ad_group | length == 0
+        - unauthorized_members | length == 0
+
+    - name: Fail if there are unauthorized members
+      ansible.builtin.fail:
+        msg: |
+          ❌ FAILED: Found {{ unauthorized_members | length }} unauthorized member(s) in '{{ ad_global_admins_group }}':
+          {{ unauthorized_members | join(', ') }}
+      when: unauthorized_members | length > 0
+
+    - name: Fail if approved admins are missing from group
+      ansible.builtin.fail:
+        msg: |
+          ❌ FAILED: {{ missing_from_ad_group | length }} approved admin(s) are missing from '{{ ad_global_admins_group }}':
+          {{ missing_from_ad_group | join(', ') }}
+      when: missing_from_ad_group | length > 0
